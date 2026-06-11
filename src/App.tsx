@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, type CSSProperties, type ReactNode } from 'react';
 import { formatUnits, isAddress, parseUnits, type Address } from 'viem';
 import { waitForTransactionReceipt } from 'wagmi/actions';
 import {
@@ -32,6 +32,7 @@ type TokenInfo = {
 };
 
 type TxRecord = { label: string; hash: `0x${string}` };
+type VaultStatus = 'Minting open' | 'Exercise period' | 'Ready to settle' | 'Settled' | 'Loading';
 
 function getResult<T>(item: unknown): T | undefined {
   if (!item || typeof item !== 'object' || !('result' in item)) return undefined;
@@ -40,12 +41,16 @@ function getResult<T>(item: unknown): T | undefined {
 
 function formatAmount(value?: bigint, decimals?: number, fallback = '—') {
   if (value === undefined || decimals === undefined) return fallback;
-  return formatUnits(value, decimals);
+  const formatted = formatUnits(value, decimals);
+  const [whole, fraction] = formatted.split('.');
+  if (!fraction) return whole;
+  const trimmedFraction = fraction.replace(/0+$/, '').slice(0, 6);
+  return trimmedFraction ? `${whole}.${trimmedFraction}` : whole;
 }
 
 function unixToDate(value?: bigint) {
   if (value === undefined) return '—';
-  return `${value.toString()} (${new Date(Number(value) * 1000).toLocaleString()})`;
+  return `${new Date(Number(value) * 1000).toLocaleString()} · ${value.toString()}`;
 }
 
 function parseHumanAmount(value: string, decimals?: number) {
@@ -60,6 +65,17 @@ function parseHumanAmount(value: string, decimals?: number) {
 function displayAddress(address?: string) {
   if (!address) return '—';
   return `${address.slice(0, 6)}…${address.slice(-4)}`;
+}
+
+function toFiniteNumber(value?: bigint, decimals?: number) {
+  if (value === undefined || decimals === undefined) return 0;
+  const parsed = Number(formatUnits(value, decimals));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function percent(part: number, total: number) {
+  if (!total || !Number.isFinite(total)) return 0;
+  return Math.max(0, Math.min(100, (part / total) * 100));
 }
 
 export default function App() {
@@ -185,9 +201,9 @@ export default function App() {
     return info;
   }, [collateral, nToken, pToken, tokenReads.data, usdc]);
 
-  const status = useMemo(() => {
+  const status = useMemo<VaultStatus>(() => {
     if (settled) return 'Settled';
-    if (maturity === undefined || exerciseDeadline === undefined) return '—';
+    if (maturity === undefined || exerciseDeadline === undefined) return 'Loading';
     const now = BigInt(Math.floor(Date.now() / 1000));
     if (now < maturity) return 'Minting open';
     if (now < exerciseDeadline) return 'Exercise period';
@@ -242,7 +258,7 @@ export default function App() {
   };
 
   const requireAmount = (value: bigint | undefined, label: string) => {
-    if (value === undefined) throw new Error(`Enter a valid ${label} amount.`);
+    if (value === undefined || value <= 0n) throw new Error(`Enter a valid ${label} amount greater than zero.`);
     return value;
   };
 
@@ -252,47 +268,107 @@ export default function App() {
     functionName: 'allVaultsLength',
   });
 
+  const collateralVault = toFiniteNumber(tokenInfo.collateral.vaultBalance, tokenInfo.collateral.decimals);
+  const usdcVault = toFiniteNumber(tokenInfo.usdc.vaultBalance, tokenInfo.usdc.decimals);
+  const vaultCompositionTotal = collateralVault + usdcVault;
+  const collateralVaultPercent = percent(collateralVault, vaultCompositionTotal);
+  const usdcVaultPercent = percent(usdcVault, vaultCompositionTotal);
+  const previewCollateralOut = previewRedeemRead.data?.[0];
+  const previewUsdcOut = previewRedeemRead.data?.[1];
+  const userReady = isConnected && onBase;
+
   return (
     <main>
-      <header className="hero">
-        <div>
-          <p className="eyebrow">Base Mainnet · SplitVault test console</p>
-          <h1>Experimental options-backed lending primitive UI</h1>
-          <p className="muted">Borrower locks collateral, receives P/N tokens, exercises N with USDC, and lets P holders redeem after the deadline.</p>
+      <header className="hero pro-card">
+        <div className="hero-copy">
+          <div className="pill-row">
+            <span className="pill success-dot">Base Mainnet</span>
+            <span className="pill">No backend</span>
+            <span className="pill">Test console</span>
+          </div>
+          <p className="eyebrow">SplitVault</p>
+          <h1>Options-backed lending, explained step by step.</h1>
+          <p className="hero-subtitle">
+            Lock collateral, mint two claim tokens, sell P off-app for USDC, keep N to reclaim collateral, and let P holders redeem after expiry.
+          </p>
+          <div className="hero-actions">
+            <a className="button ghost" href="#borrow">Start borrower flow</a>
+            <a className="button ghost" href="#redeem">Redeem P</a>
+          </div>
         </div>
-        <div className="warning">Experimental unaudited test UI. Not a real lending product. P buyers can lose money. No oracle. No liquidation. Use tiny amounts only.</div>
+        <div className="risk-panel">
+          <span className="risk-icon">!</span>
+          <div>
+            <h2>Experimental unaudited test UI</h2>
+            <p>Not a real lending product. P buyers can lose money. No oracle. No liquidation. Use tiny amounts only.</p>
+          </div>
+        </div>
       </header>
 
-      <Section title="1. Wallet / network">
-        <div className="grid two">
-          <Info label="Connected address" value={address ?? 'Not connected'} />
-          <Info label="Network" value={onBase ? 'Base Mainnet (8453)' : `Wrong or unknown network (${chainId})`} tone={onBase ? 'ok' : 'bad'} />
+      <section className="quick-grid" aria-label="Current setup summary">
+        <MetricCard label="Wallet" value={address ? displayAddress(address) : 'Not connected'} detail={userReady ? 'Ready on Base' : 'Connect and switch to Base'} tone={userReady ? 'good' : 'warn'} />
+        <MetricCard label="Vault status" value={status} detail={statusHelp(status)} tone={status === 'Ready to settle' ? 'warn' : 'good'} />
+        <MetricCard label="Strike" value={strikeWad ? formatAmount(strikeWad, 18) : '—'} detail="USDC owed is calculated by the vault" />
+        <MetricCard label="Latest tx" value={txs[0] ? displayAddress(txs[0].hash) : 'None'} detail={txs[0]?.label ?? 'Transactions appear here'} />
+      </section>
+
+      <Section eyebrow="How it works" title="A beginner-friendly map of the product">
+        <FlowDiagram />
+        <div className="education-grid">
+          <ExplainerCard number="01" title="Borrower locks collateral" text="The vault takes the meme token and mints two matching ERC20 tokens: P and N." />
+          <ExplainerCard number="02" title="P is the lender claim" text="The borrower can transfer or sell P off-app. Holding P gives redemption rights after the exercise deadline." />
+          <ExplainerCard number="03" title="N is the reclaim option" text="The borrower keeps N. Exercising N burns it, pays USDC, and returns collateral before the deadline." />
         </div>
-        <div className="row wrap">
-          {!isConnected ? (
-            connectors.map((connector) => (
-              <button key={connector.uid} onClick={() => connectAsync({ connector })}>
-                Connect {connector.name}
+      </Section>
+
+      <Section eyebrow="Wallet" title="1. Connect and confirm Base Mainnet">
+        <div className="wallet-panel">
+          <div className="grid two">
+            <Info label="Connected address" value={address ?? 'Not connected'} />
+            <Info label="Network" value={onBase ? 'Base Mainnet (8453)' : `Wrong or unknown network (${chainId})`} tone={onBase ? 'ok' : 'bad'} />
+          </div>
+          <div className="row wrap">
+            {!isConnected ? (
+              connectors.map((connector) => (
+                <button key={connector.uid} onClick={() => connectAsync({ connector })}>
+                  Connect {connector.name}
+                </button>
+              ))
+            ) : (
+              <button className="secondary" onClick={() => disconnect()}>
+                Disconnect
               </button>
-            ))
-          ) : (
-            <button className="secondary" onClick={() => disconnect()}>
-              Disconnect
-            </button>
-          )}
-          {!onBase && (
-            <button onClick={() => switchChainAsync({ chainId: base.id })}>Switch to Base</button>
-          )}
+            )}
+            {!onBase && <button onClick={() => switchChainAsync({ chainId: base.id })}>Switch to Base</button>}
+          </div>
         </div>
         <Errors errors={[connectError?.message, switchError?.message]} />
       </Section>
 
-      <Section title="2. Existing Vault Dashboard">
+      <Section eyebrow="Vault" title="2. Existing vault dashboard">
         <label>
           Vault address
           <input value={vaultInput} onChange={(event) => setVaultInput(event.target.value as Address)} />
         </label>
-        <div className="grid three">
+
+        <div className="dashboard-grid top-space">
+          <div className="pro-card status-card">
+            <span className={`status-badge ${statusClass(status)}`}>{status}</span>
+            <h3>{statusHeadline(status)}</h3>
+            <p className="muted">{statusHelp(status)}</p>
+            <LifecycleTimeline maturity={maturity} exerciseDeadline={exerciseDeadline} settled={settled} />
+          </div>
+          <VaultCompositionChart
+            collateralSymbol={tokenInfo.collateral.symbol ?? 'Collateral'}
+            usdcSymbol={tokenInfo.usdc.symbol ?? 'USDC'}
+            collateralPercent={collateralVaultPercent}
+            usdcPercent={usdcVaultPercent}
+            collateralAmount={`${formatAmount(tokenInfo.collateral.vaultBalance, tokenInfo.collateral.decimals)} ${tokenInfo.collateral.symbol ?? ''}`}
+            usdcAmount={`${formatAmount(tokenInfo.usdc.vaultBalance, tokenInfo.usdc.decimals)} ${tokenInfo.usdc.symbol ?? ''}`}
+          />
+        </div>
+
+        <div className="grid four top-space">
           <Info label="collateral()" value={collateral} />
           <Info label="usdc()" value={usdc} />
           <Info label="pToken()" value={pToken} />
@@ -301,81 +377,107 @@ export default function App() {
           <Info label="maturity()" value={unixToDate(maturity)} />
           <Info label="exerciseDeadline()" value={unixToDate(exerciseDeadline)} />
           <Info label="settled()" value={String(settled ?? '—')} />
-          <Info label="Status" value={status} tone={status === 'Settled' ? 'ok' : undefined} />
         </div>
-        <h3>Token metadata and balances</h3>
-        <div className="table">
-          <div className="tr head"><span>Token</span><span>Address</span><span>Decimals</span><span>Your balance</span><span>Vault balance</span><span>Allowance to vault</span></div>
-          <TokenRow label="Collateral" token={tokenInfo.collateral} />
-          <TokenRow label="USDC" token={tokenInfo.usdc} />
-          <TokenRow label="P" token={tokenInfo.p} />
-          <TokenRow label="N" token={tokenInfo.n} />
+
+        <h3>Your wallet and vault balances</h3>
+        <div className="balance-cards">
+          <TokenBalanceCard label="Collateral" token={tokenInfo.collateral} />
+          <TokenBalanceCard label="USDC" token={tokenInfo.usdc} />
+          <TokenBalanceCard label="P token" token={tokenInfo.p} description="P = lender redemption claim" />
+          <TokenBalanceCard label="N token" token={tokenInfo.n} description="N = borrower reclaim option" />
         </div>
       </Section>
 
-      <Section title="3. Borrower flow">
-        <p className="muted">Expected result: you deposit the collateral amount and receive the same raw amount of P and N tokens.</p>
-        <div className="grid two">
-          <label>
-            Collateral amount ({tokenInfo.collateral.symbol ?? 'human units'})
-            <input value={collateralAmount} onChange={(event) => setCollateralAmount(event.target.value)} placeholder="0.0" />
-          </label>
-          <Info label="Parsed raw amount" value={collateralAmountRaw?.toString() ?? '—'} />
-        </div>
-        <div className="row wrap">
-          <button disabled={!collateral || !vaultAddress || isWriting} onClick={() => runTx('Approve collateral', () => writeContractAsync({ address: collateral!, abi: ERC20_ABI, functionName: 'approve', args: [requireVault(), requireAmount(collateralAmountRaw, 'collateral')] }))}>
-            Approve collateral to vault
-          </button>
-          <button disabled={!vaultAddress || isWriting} onClick={() => runTx('Mint P/N', () => writeContractAsync({ address: requireVault(), abi: SPLIT_VAULT_ABI, functionName: 'mint', args: [requireAmount(collateralAmountRaw, 'collateral')] }))}>
-            Mint P/N
-          </button>
-        </div>
-        <h3>Transfer P off-app settlement token</h3>
-        <div className="grid two">
-          <label>Recipient address<input value={pRecipient} onChange={(event) => setPRecipient(event.target.value)} placeholder="0x…" /></label>
-          <label>P amount<input value={pTransferAmount} onChange={(event) => setPTransferAmount(event.target.value)} placeholder="0.0" /></label>
-        </div>
-        <button disabled={!pToken || isWriting} onClick={() => runTx('Transfer P', () => writeContractAsync({ address: pToken!, abi: ERC20_ABI, functionName: 'transfer', args: [requireAddress(pRecipient, 'Recipient'), requireAmount(pTransferRaw, 'P transfer')] }))}>
-          Transfer P
-        </button>
-      </Section>
-
-      <Section title="4. Exercise flow">
-        <p className="muted">Burn N + pay USDC → reclaim collateral.</p>
-        <div className="grid two">
-          <label>N amount<input value={nExerciseAmount} onChange={(event) => setNExerciseAmount(event.target.value)} placeholder="0.0" /></label>
-          <Info label="USDC owed" value={`${formatAmount(usdcOwedRead.data, tokenInfo.usdc.decimals)} ${tokenInfo.usdc.symbol ?? ''}`} />
-        </div>
-        <div className="row wrap">
-          <button disabled={!usdc || !vaultAddress || isWriting || usdcOwedRead.data === undefined} onClick={() => runTx('Approve USDC', () => writeContractAsync({ address: usdc!, abi: ERC20_ABI, functionName: 'approve', args: [requireVault(), usdcOwedRead.data ?? 0n] }))}>
-            Approve USDC to vault
-          </button>
-          <button disabled={!vaultAddress || isWriting} onClick={() => runTx('Exercise N', () => writeContractAsync({ address: requireVault(), abi: SPLIT_VAULT_ABI, functionName: 'exercise', args: [requireAmount(nExerciseRaw, 'N exercise')] }))}>
-            Exercise
-          </button>
-        </div>
-      </Section>
-
-      <Section title="5. Settlement / P holder flow">
-        <p className="muted">Burn P → receive USDC if N was exercised, otherwise collateral.</p>
-        <button disabled={!vaultAddress || isWriting} onClick={() => runTx('Settle vault', () => writeContractAsync({ address: requireVault(), abi: SPLIT_VAULT_ABI, functionName: 'settle' }))}>
-          Settle
-        </button>
-        <div className="grid two top-space">
-          <label>P amount<input value={pRedeemAmount} onChange={(event) => setPRedeemAmount(event.target.value)} placeholder="0.0" /></label>
-          <div className="card subtle">
-            <Info label="Expected collateralOut" value={`${formatAmount(previewRedeemRead.data?.[0], tokenInfo.collateral.decimals)} ${tokenInfo.collateral.symbol ?? ''}`} />
-            <Info label="Expected usdcOut" value={`${formatAmount(previewRedeemRead.data?.[1], tokenInfo.usdc.decimals)} ${tokenInfo.usdc.symbol ?? ''}`} />
+      <Section id="borrow" eyebrow="Borrower" title="3. Lock collateral and mint P/N">
+        <div className="split-layout">
+          <div>
+            <StepHeader step="A" title="Approve collateral" text="This permits the vault to pull only the amount you enter. Approval is required before minting." />
+            <label>
+              Collateral amount ({tokenInfo.collateral.symbol ?? 'human units'})
+              <input value={collateralAmount} onChange={(event) => setCollateralAmount(event.target.value)} placeholder="0.0" />
+            </label>
+            <Info label="Raw amount sent to contract" value={collateralAmountRaw?.toString() ?? '—'} />
+            <div className="row wrap top-space">
+              <button disabled={!collateral || !vaultAddress || isWriting} onClick={() => runTx('Approve collateral', () => writeContractAsync({ address: collateral!, abi: ERC20_ABI, functionName: 'approve', args: [requireVault(), requireAmount(collateralAmountRaw, 'collateral')] }))}>
+                Approve collateral
+              </button>
+              <button disabled={!vaultAddress || isWriting} onClick={() => runTx('Mint P/N', () => writeContractAsync({ address: requireVault(), abi: SPLIT_VAULT_ABI, functionName: 'mint', args: [requireAmount(collateralAmountRaw, 'collateral')] }))}>
+                Mint P + N
+              </button>
+            </div>
           </div>
+          <ResultPreview
+            title="Expected mint result"
+            rows={[
+              ['You deposit', `${collateralAmount || '0'} ${tokenInfo.collateral.symbol ?? 'collateral'}`],
+              ['You receive', `${collateralAmount || '0'} P + ${collateralAmount || '0'} N`],
+              ['What happens next', 'Transfer/sell P off-app; keep N to exercise'],
+            ]}
+          />
         </div>
-        <button disabled={!vaultAddress || isWriting} onClick={() => runTx('Redeem P', () => writeContractAsync({ address: requireVault(), abi: SPLIT_VAULT_ABI, functionName: 'redeemP', args: [requireAmount(pRedeemRaw, 'P redeem')] }))}>
-          Redeem P
-        </button>
+
+        <div className="pro-card top-space">
+          <StepHeader step="B" title="Transfer P to a lender" text="Use this after an off-app agreement. The app only transfers P; it does not handle the USDC sale." />
+          <div className="grid two">
+            <label>Recipient address<input value={pRecipient} onChange={(event) => setPRecipient(event.target.value)} placeholder="0x…" /></label>
+            <label>P amount<input value={pTransferAmount} onChange={(event) => setPTransferAmount(event.target.value)} placeholder="0.0" /></label>
+          </div>
+          <button className="top-space" disabled={!pToken || isWriting} onClick={() => runTx('Transfer P', () => writeContractAsync({ address: pToken!, abi: ERC20_ABI, functionName: 'transfer', args: [requireAddress(pRecipient, 'Recipient'), requireAmount(pTransferRaw, 'P transfer')] }))}>
+            Transfer P
+          </button>
+        </div>
       </Section>
 
-      <Section title="6. Optional create vault panel">
-        <details>
-          <summary>Advanced: create a new vault from factory</summary>
+      <Section eyebrow="Exercise" title="4. Burn N + pay USDC → reclaim collateral">
+        <div className="split-layout">
+          <div>
+            <StepHeader step="C" title="Quote USDC owed" text="Enter the amount of N to exercise. The vault returns the exact USDC owed before you approve or transact." />
+            <label>N amount<input value={nExerciseAmount} onChange={(event) => setNExerciseAmount(event.target.value)} placeholder="0.0" /></label>
+            <div className="quote-box">
+              <span>USDC owed</span>
+              <strong>{formatAmount(usdcOwedRead.data, tokenInfo.usdc.decimals)} {tokenInfo.usdc.symbol ?? ''}</strong>
+              <small>Exact value from usdcOwed(amount)</small>
+            </div>
+            <div className="row wrap top-space">
+              <button disabled={!usdc || !vaultAddress || isWriting || usdcOwedRead.data === undefined} onClick={() => runTx('Approve USDC', () => writeContractAsync({ address: usdc!, abi: ERC20_ABI, functionName: 'approve', args: [requireVault(), usdcOwedRead.data ?? 0n] }))}>
+                Approve USDC
+              </button>
+              <button disabled={!vaultAddress || isWriting} onClick={() => runTx('Exercise N', () => writeContractAsync({ address: requireVault(), abi: SPLIT_VAULT_ABI, functionName: 'exercise', args: [requireAmount(nExerciseRaw, 'N exercise')] }))}>
+                Exercise N
+              </button>
+            </div>
+          </div>
+          <PayoffSketch />
+        </div>
+      </Section>
+
+      <Section id="redeem" eyebrow="P holder" title="5. Settle and redeem P after the deadline">
+        <div className="split-layout">
+          <div>
+            <StepHeader step="D" title="Settle vault" text="After the exercise deadline, anyone can call settle once. Then P holders can redeem." />
+            <button disabled={!vaultAddress || isWriting} onClick={() => runTx('Settle vault', () => writeContractAsync({ address: requireVault(), abi: SPLIT_VAULT_ABI, functionName: 'settle' }))}>
+              Settle vault
+            </button>
+            <label className="top-space">P amount<input value={pRedeemAmount} onChange={(event) => setPRedeemAmount(event.target.value)} placeholder="0.0" /></label>
+            <button className="top-space" disabled={!vaultAddress || isWriting} onClick={() => runTx('Redeem P', () => writeContractAsync({ address: requireVault(), abi: SPLIT_VAULT_ABI, functionName: 'redeemP', args: [requireAmount(pRedeemRaw, 'P redeem')] }))}>
+              Redeem P
+            </button>
+          </div>
+          <ResultPreview
+            title="Preview redemption"
+            rows={[
+              ['collateralOut', `${formatAmount(previewCollateralOut, tokenInfo.collateral.decimals)} ${tokenInfo.collateral.symbol ?? ''}`],
+              ['usdcOut', `${formatAmount(previewUsdcOut, tokenInfo.usdc.decimals)} ${tokenInfo.usdc.symbol ?? ''}`],
+              ['Rule of thumb', 'Burn P → receive USDC if N exercised; otherwise collateral'],
+            ]}
+          />
+        </div>
+      </Section>
+
+      <Section eyebrow="Advanced" title="6. Create a new vault">
+        <details className="advanced-panel">
+          <summary>Advanced factory controls</summary>
+          <p className="muted">Only use this if you understand the contract parameters. Base USDC is pre-filled.</p>
           <div className="grid two top-space">
             <label>Collateral address<input value={createForm.collateral} onChange={(e) => setCreateForm({ ...createForm, collateral: e.target.value })} placeholder="0x…" /></label>
             <label>USDC address<input value={createForm.usdc} onChange={(e) => setCreateForm({ ...createForm, usdc: e.target.value as Address })} /></label>
@@ -385,16 +487,18 @@ export default function App() {
             <label>namePrefix<input value={createForm.namePrefix} onChange={(e) => setCreateForm({ ...createForm, namePrefix: e.target.value })} placeholder="My Meme Vault" /></label>
             <label>symbolPrefix<input value={createForm.symbolPrefix} onChange={(e) => setCreateForm({ ...createForm, symbolPrefix: e.target.value })} placeholder="MME" /></label>
           </div>
-          <button onClick={() => runTx('Create vault', () => writeContractAsync({ address: FACTORY_ADDRESS, abi: FACTORY_ABI, functionName: 'createVault', args: [requireAddress(createForm.collateral, 'Collateral'), requireAddress(createForm.usdc, 'USDC'), BigInt(createForm.strikeWad), BigInt(createForm.maturity), BigInt(createForm.exerciseWindow), createForm.namePrefix, createForm.symbolPrefix] }))}>
+          <button className="top-space" onClick={() => runTx('Create vault', () => writeContractAsync({ address: FACTORY_ADDRESS, abi: FACTORY_ABI, functionName: 'createVault', args: [requireAddress(createForm.collateral, 'Collateral'), requireAddress(createForm.usdc, 'USDC'), BigInt(createForm.strikeWad), BigInt(createForm.maturity), BigInt(createForm.exerciseWindow), createForm.namePrefix, createForm.symbolPrefix] }))}>
             createVault(...)
           </button>
           <p className="muted">After tx: Find new vault address from VaultCreated event or allVaults(index). Current allVaultsLength(): {allVaultsLengthRead.data?.toString() ?? '—'}</p>
         </details>
       </Section>
 
-      <Section title="Transactions and errors">
+      <Section eyebrow="Activity" title="Transactions and errors">
         <Errors errors={[txError, writeError?.message]} />
-        {txs.length === 0 ? <p className="muted">No transactions sent yet.</p> : txs.map((tx) => <p key={tx.hash}><strong>{tx.label}:</strong> <a href={`${BLOCKSCOUT_TX}${tx.hash}`} target="_blank" rel="noreferrer">{tx.hash}</a></p>)}
+        <div className="tx-list">
+          {txs.length === 0 ? <p className="muted">No transactions sent yet. Your hashes will appear here with Base Blockscout links.</p> : txs.map((tx) => <p key={tx.hash}><strong>{tx.label}:</strong> <a href={`${BLOCKSCOUT_TX}${tx.hash}`} target="_blank" rel="noreferrer">{tx.hash}</a></p>)}
+        </div>
       </Section>
 
       <details className="debug">
@@ -405,25 +509,143 @@ export default function App() {
   );
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return <section><h2>{title}</h2>{children}</section>;
+function Section({ id, eyebrow, title, children }: { id?: string; eyebrow: string; title: string; children: ReactNode }) {
+  return <section id={id} className="pro-card"><p className="section-eyebrow">{eyebrow}</p><h2>{title}</h2>{children}</section>;
 }
 
 function Info({ label, value, tone }: { label: string; value?: string; tone?: 'ok' | 'bad' }) {
   return <div className={`info ${tone ?? ''}`}><span>{label}</span><strong>{value ?? '—'}</strong></div>;
 }
 
-function TokenRow({ label, token }: { label: string; token: TokenInfo }) {
+function MetricCard({ label, value, detail, tone }: { label: string; value: string; detail: string; tone?: 'good' | 'warn' }) {
+  return <article className={`metric-card ${tone ?? ''}`}><span>{label}</span><strong>{value}</strong><small>{detail}</small></article>;
+}
+
+function TokenBalanceCard({ label, token, description }: { label: string; token: TokenInfo; description?: string }) {
   return (
-    <div className="tr">
-      <span><strong>{label}</strong> {token.symbol ? `(${token.symbol})` : ''}<small>{token.name}</small></span>
-      <span title={token.address}>{displayAddress(token.address)}</span>
-      <span>{token.decimals ?? '—'}</span>
-      <span>{formatAmount(token.userBalance, token.decimals)}</span>
-      <span>{formatAmount(token.vaultBalance, token.decimals)}</span>
-      <span>{formatAmount(token.allowance, token.decimals)}</span>
+    <article className="token-card">
+      <div className="token-card-head">
+        <div><span>{label}</span><strong>{token.symbol ?? '—'}</strong></div>
+        <code title={token.address}>{displayAddress(token.address)}</code>
+      </div>
+      <p>{description ?? token.name ?? 'Token used by this vault'}</p>
+      <div className="token-stats">
+        <Info label="Your balance" value={formatAmount(token.userBalance, token.decimals)} />
+        <Info label="Vault balance" value={formatAmount(token.vaultBalance, token.decimals)} />
+        <Info label="Allowance" value={formatAmount(token.allowance, token.decimals)} />
+        <Info label="Decimals" value={token.decimals?.toString() ?? '—'} />
+      </div>
+    </article>
+  );
+}
+
+function FlowDiagram() {
+  return (
+    <div className="flow-diagram" aria-label="SplitVault flow diagram">
+      <div className="flow-node borrower"><span>Borrower</span><strong>locks meme collateral</strong></div>
+      <div className="flow-arrow">→</div>
+      <div className="flow-node vault"><span>SplitVault</span><strong>mints P + N</strong></div>
+      <div className="flow-arrow">→</div>
+      <div className="flow-node split"><span>P token</span><strong>sell/transfer to lender</strong></div>
+      <div className="flow-node split"><span>N token</span><strong>keep to exercise</strong></div>
     </div>
   );
+}
+
+function ExplainerCard({ number, title, text }: { number: string; title: string; text: string }) {
+  return <article className="explainer-card"><span>{number}</span><h3>{title}</h3><p>{text}</p></article>;
+}
+
+function StepHeader({ step, title, text }: { step: string; title: string; text: string }) {
+  return <div className="step-header"><span>{step}</span><div><h3>{title}</h3><p>{text}</p></div></div>;
+}
+
+function ResultPreview({ title, rows }: { title: string; rows: Array<[string, string]> }) {
+  return <aside className="result-preview"><h3>{title}</h3>{rows.map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong></div>)}</aside>;
+}
+
+function LifecycleTimeline({ maturity, exerciseDeadline, settled }: { maturity?: bigint; exerciseDeadline?: bigint; settled?: boolean }) {
+  const now = Math.floor(Date.now() / 1000);
+  const maturityNumber = maturity ? Number(maturity) : undefined;
+  const deadlineNumber = exerciseDeadline ? Number(exerciseDeadline) : undefined;
+  const progress = maturityNumber && deadlineNumber && deadlineNumber > maturityNumber
+    ? percent(now - maturityNumber, deadlineNumber - maturityNumber)
+    : settled ? 100 : 0;
+
+  return (
+    <div className="timeline-card">
+      <div className="timeline-track"><span style={{ width: `${progress}%` }} /></div>
+      <div className="timeline-labels">
+        <span>Mint</span>
+        <span>Maturity</span>
+        <span>Deadline</span>
+        <span>Settle</span>
+      </div>
+    </div>
+  );
+}
+
+function VaultCompositionChart({ collateralSymbol, usdcSymbol, collateralPercent, usdcPercent, collateralAmount, usdcAmount }: { collateralSymbol: string; usdcSymbol: string; collateralPercent: number; usdcPercent: number; collateralAmount: string; usdcAmount: string }) {
+  const collateralStyle = { '--pct': `${collateralPercent}%` } as CSSProperties;
+  const usdcStyle = { '--pct': `${usdcPercent}%` } as CSSProperties;
+  return (
+    <div className="pro-card chart-card">
+      <div><p className="section-eyebrow">Vault composition</p><h3>What P holders can eventually receive</h3></div>
+      <div className="donut" style={{ background: `conic-gradient(#6d5dfc 0 ${collateralPercent}%, #00b894 ${collateralPercent}% ${collateralPercent + usdcPercent}%, #e8edf7 0)` }}>
+        <span>{Math.round(collateralPercent + usdcPercent)}%</span>
+      </div>
+      <div className="chart-legend">
+        <div><i className="purple" /><span>{collateralSymbol}</span><strong>{collateralAmount}</strong><div className="mini-bar"><span style={collateralStyle} /></div></div>
+        <div><i className="green" /><span>{usdcSymbol}</span><strong>{usdcAmount}</strong><div className="mini-bar"><span style={usdcStyle} /></div></div>
+      </div>
+    </div>
+  );
+}
+
+function PayoffSketch() {
+  return (
+    <aside className="payoff-card">
+      <h3>Exercise intuition</h3>
+      <p className="muted">Exercising N swaps a fixed USDC payment for collateral return.</p>
+      <svg viewBox="0 0 320 180" role="img" aria-label="Simple exercise payoff sketch">
+        <path d="M32 148H292" className="axis" />
+        <path d="M44 160V24" className="axis" />
+        <path d="M48 136 C92 136 118 136 140 120 C178 92 202 52 282 40" className="curve" />
+        <path d="M52 136 H140 V120" className="strike-line" />
+        <text x="42" y="174">Low collateral value</text>
+        <text x="178" y="174">High collateral value</text>
+        <text x="146" y="116">Strike</text>
+      </svg>
+      <p className="caption">This chart is educational only; the contract uses its own fixed strike math and no oracle.</p>
+    </aside>
+  );
+}
+
+function statusClass(status: VaultStatus) {
+  if (status === 'Ready to settle') return 'warn';
+  if (status === 'Settled') return 'done';
+  if (status === 'Loading') return 'loading';
+  return 'live';
+}
+
+function statusHeadline(status: VaultStatus) {
+  switch (status) {
+    case 'Minting open': return 'Borrowers can mint new P/N pairs.';
+    case 'Exercise period': return 'N holders can exercise to reclaim collateral.';
+    case 'Ready to settle': return 'Exercise is closed. Settle can be called.';
+    case 'Settled': return 'Vault is settled. P redemption is active.';
+    default: return 'Loading vault state from Base.';
+  }
+}
+
+function statusHelp(status: VaultStatus) {
+  switch (status) {
+    case 'Minting open': return 'Before maturity, borrowers can deposit collateral and mint P/N.';
+    case 'Exercise period': return 'After maturity and before the deadline, N can be burned with USDC to reclaim collateral.';
+    case 'Ready to settle': return 'The deadline has passed and settle() has not been called yet.';
+    case 'Settled': return 'P holders can redeem according to final vault balances.';
+    default: return 'Connect and wait for contract reads to resolve.';
+  }
 }
 
 function Errors({ errors }: { errors: Array<string | undefined> }) {
